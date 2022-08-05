@@ -11,6 +11,7 @@ use fvm_shared::econ::TokenAmount;
 use fvm_shared::sector::{Spacetime, StoragePower};
 use fvm_shared::smooth::{AlphaBetaFilter, FilterEstimate, DEFAULT_ALPHA, DEFAULT_BETA};
 use lazy_static::lazy_static;
+use log::info;
 use num_derive::FromPrimitive;
 
 use super::logic::*;
@@ -120,7 +121,7 @@ impl State {
             &self.cumsum_realized,
             &self.cumsum_baseline,
         );
-        println!("before update epoch{} cumsum_realized: {} cumsum_baseline: {} effective_baseline_power: {} effective_network_time: {} curr_realized_power: {}", self.epoch, 
+        info!("before update epoch{} cumsum_realized: {} cumsum_baseline: {} effective_baseline_power: {} effective_network_time: {} curr_realized_power: {}", self.epoch, 
         self.cumsum_realized, self.cumsum_baseline, self.effective_baseline_power, self.effective_network_time, curr_realized_power);
         self.update_to_next_epoch(curr_realized_power);
         let curr_reward_theta = compute_r_theta(
@@ -129,7 +130,7 @@ impl State {
             &self.cumsum_realized,
             &self.cumsum_baseline,
         );
-        println!("after update epoch{} cumsum_realized: {} cumsum_baseline: {} effective_baseline_power: {} effective_network_time: {}", self.epoch,
+        info!("after update epoch{} cumsum_realized: {} cumsum_baseline: {} effective_baseline_power: {} effective_network_time: {}", self.epoch,
         self.cumsum_realized, self.cumsum_baseline, self.effective_baseline_power, self.effective_network_time);
 
         self.this_epoch_reward = compute_reward(
