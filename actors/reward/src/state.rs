@@ -120,6 +120,8 @@ impl State {
             &self.cumsum_realized,
             &self.cumsum_baseline,
         );
+        println!("before update epoch{} cumsum_realized: {} cumsum_baseline: {} effective_baseline_power: {} effective_network_time: {} curr_realized_power: {}", self.epoch, 
+        self.cumsum_realized, self.cumsum_baseline, self.effective_baseline_power, self.effective_network_time, curr_realized_power);
         self.update_to_next_epoch(curr_realized_power);
         let curr_reward_theta = compute_r_theta(
             self.effective_network_time,
@@ -127,6 +129,8 @@ impl State {
             &self.cumsum_realized,
             &self.cumsum_baseline,
         );
+        println!("after update epoch{} cumsum_realized: {} cumsum_baseline: {} effective_baseline_power: {} effective_network_time: {}", self.epoch,
+        self.cumsum_realized, self.cumsum_baseline, self.effective_baseline_power, self.effective_network_time);
 
         self.this_epoch_reward = compute_reward(
             self.epoch,
