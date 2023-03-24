@@ -202,6 +202,9 @@ impl Actor {
             let prev = st.epoch;
             // if there were null runs catch up the computation until
             // st.Epoch == rt.CurrEpoch()
+            log::info!(target: "reward", "state_epoch: {:?} rt_epoch: {:?} effective_network_time: {:?} cumsum_realized: {:?} cumsum_baseline: {:?}", 
+            prev, rt.curr_epoch(), st.effective_network_time, st.cumsum_realized, st.cumsum_baseline);
+            
             while st.epoch < rt.curr_epoch() {
                 // Update to next epoch to process null rounds
                 st.update_to_next_epoch(&curr_realized_power);
@@ -209,7 +212,6 @@ impl Actor {
 
             st.update_to_next_epoch_with_reward(&curr_realized_power);
             st.update_smoothed_estimates(st.epoch - prev);
-            log::info!(target: "reward", "state_epoch: {:?} rt_epoch: {:?} effective_network_time: {:?}", st.epoch, rt.curr_epoch(), st.effective_network_time);
             Ok(())
         })?;
         Ok(())
