@@ -3,7 +3,7 @@ use fil_actors_runtime::{
     runtime::{Runtime, RuntimePolicy},
     test_utils::MockRuntime,
 };
-use fvm_shared::{address::Address, econ::TokenAmount};
+use fvm_shared::address::Address;
 
 mod util;
 use util::*;
@@ -11,14 +11,13 @@ use util::*;
 const NEW_WORKER: Address = Address::new_id(999);
 
 fn setup() -> (ActorHarness, MockRuntime) {
-    let big_balance = 20u128.pow(23);
     let period_offset = 100;
     let current_epoch = 5;
 
     let h = ActorHarness::new(period_offset);
-    let mut rt = h.new_runtime();
-    h.construct_and_verify(&mut rt);
-    rt.balance.replace(TokenAmount::from(big_balance));
+    let rt = h.new_runtime();
+    h.construct_and_verify(&rt);
+    rt.balance.replace(BIG_BALANCE.clone());
     rt.set_epoch(current_epoch);
 
     (h, rt)
@@ -26,14 +25,14 @@ fn setup() -> (ActorHarness, MockRuntime) {
 
 #[test]
 fn successfully_changes_the_worker_address() {
-    let (h, mut rt) = setup();
+    let (h, rt) = setup();
 
-    let effective_epoch = rt.epoch + rt.policy().worker_key_change_delay;
-    h.change_worker_address(&mut rt, NEW_WORKER, h.control_addrs.clone()).unwrap();
+    let effective_epoch = *rt.epoch.borrow() + rt.policy().worker_key_change_delay;
+    h.change_worker_address(&rt, NEW_WORKER, h.control_addrs.clone()).unwrap();
 
     // confirm at effective epoch
     rt.set_epoch(effective_epoch);
-    h.confirm_update_worker_key(&mut rt).unwrap();
+    h.confirm_change_worker_address(&rt).unwrap();
 
     let state: State = rt.get_state();
     let info = state.get_info(rt.store()).unwrap();
@@ -46,14 +45,14 @@ fn successfully_changes_the_worker_address() {
 
 #[test]
 fn does_nothing_before_the_effective_date() {
-    let (h, mut rt) = setup();
+    let (h, rt) = setup();
 
-    let effective_epoch = rt.epoch + rt.policy().worker_key_change_delay;
-    h.change_worker_address(&mut rt, NEW_WORKER, h.control_addrs.clone()).unwrap();
+    let effective_epoch = *rt.epoch.borrow() + rt.policy().worker_key_change_delay;
+    h.change_worker_address(&rt, NEW_WORKER, h.control_addrs.clone()).unwrap();
 
     // confirm right before the effective epoch
     rt.set_epoch(effective_epoch - 1);
-    h.confirm_update_worker_key(&mut rt).unwrap();
+    h.confirm_change_worker_address(&rt).unwrap();
 
     let state: State = rt.get_state();
     let info = state.get_info(rt.store()).unwrap();
@@ -69,9 +68,9 @@ fn does_nothing_before_the_effective_date() {
 
 #[test]
 fn does_nothing_when_no_update_is_set() {
-    let (h, mut rt) = setup();
+    let (h, rt) = setup();
 
-    h.confirm_update_worker_key(&mut rt).unwrap();
+    h.confirm_change_worker_address(&rt).unwrap();
 
     let state: State = rt.get_state();
     let info = state.get_info(rt.store()).unwrap();

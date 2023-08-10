@@ -4,41 +4,41 @@ use fil_actors_runtime::test_utils::expect_abort_contains_message;
 use fil_actors_runtime::test_utils::MockRuntime;
 use fvm_ipld_bitfield::BitField;
 use fvm_shared::address::Address;
-use fvm_shared::bigint::BigInt;
+
 use fvm_shared::clock::ChainEpoch;
 use fvm_shared::consensus::{ConsensusFault, ConsensusFaultType};
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::ExitCode;
+
 use num_traits::Zero;
 
 mod util;
 use crate::util::*;
 
 const PERIOD_OFFSET: ChainEpoch = 100;
-const BIG_BALANCE: u128 = 1_000_000_000_000_000_000_000_000u128;
 
 #[test]
 fn recovery_happy_path() {
-    let (mut h, mut rt) = setup();
+    let (mut h, rt) = setup();
     let one_sector =
-        h.commit_and_prove_sectors(&mut rt, 1, DEFAULT_SECTOR_EXPIRATION as u64, vec![], true);
+        h.commit_and_prove_sectors(&rt, 1, DEFAULT_SECTOR_EXPIRATION as u64, vec![], true);
 
     // advance to first proving period and submit so we'll have time to declare the fault next cycle
-    h.advance_and_submit_posts(&mut rt, &one_sector);
+    h.advance_and_submit_posts(&rt, &one_sector);
 
     // Declare the sector as faulted
-    h.declare_faults(&mut rt, &one_sector);
+    h.declare_faults(&rt, &one_sector);
 
     // Declare recoveries updates state
     let st = h.get_state(&rt);
     let (dl_idx, p_idx) =
         st.find_sector(&rt.policy, &rt.store, one_sector[0].sector_number).unwrap();
     h.declare_recoveries(
-        &mut rt,
+        &rt,
         dl_idx,
         p_idx,
         BitField::try_from_bits([one_sector[0].sector_number]).unwrap(),
-        BigInt::zero(),
+        TokenAmount::zero(),
     )
     .unwrap();
 
@@ -50,24 +50,25 @@ fn recovery_happy_path() {
 
 #[test]
 fn recovery_must_pay_back_fee_debt() {
-    let (mut h, mut rt) = setup();
+    let (mut h, rt) = setup();
     let one_sector =
-        h.commit_and_prove_sectors(&mut rt, 1, DEFAULT_SECTOR_EXPIRATION as u64, vec![], true);
+        h.commit_and_prove_sectors(&rt, 1, DEFAULT_SECTOR_EXPIRATION as u64, vec![], true);
+
     // advance to first proving period and submit so we'll have time to declare the fault next cycle
-    h.advance_and_submit_posts(&mut rt, &one_sector);
+    h.advance_and_submit_posts(&rt, &one_sector);
 
     // Fault will take miner into fee debt
     let mut st = h.get_state(&rt);
     rt.set_balance(&st.pre_commit_deposits + &st.initial_pledge + &st.locked_funds);
 
-    h.declare_faults(&mut rt, &one_sector);
+    h.declare_faults(&rt, &one_sector);
 
     st = h.get_state(&rt);
     let (dl_idx, p_idx) =
         st.find_sector(&rt.policy, &rt.store, one_sector[0].sector_number).unwrap();
 
     // Skip to end of proving period
-    h.advance_to_deadline(&mut rt, dl_idx);
+    h.advance_to_deadline(&rt, dl_idx);
 
     // Can't pay during this deadline so miner goes into fee debt
     let ongoing_pwr = power_for_sectors(h.sector_size, &one_sector);
@@ -77,9 +78,9 @@ fn recovery_must_pay_back_fee_debt() {
         &ongoing_pwr.qa,
     );
     h.advance_deadline(
-        &mut rt,
+        &rt,
         CronConfig {
-            continued_faults_penalty: BigInt::zero(), // fee is instead added to debt
+            continued_faults_penalty: TokenAmount::zero(), // fee is instead added to debt
             ..Default::default()
         },
     );
@@ -92,11 +93,11 @@ fn recovery_must_pay_back_fee_debt() {
         ExitCode::USR_INSUFFICIENT_FUNDS,
         "unlocked balance can not repay fee debt",
         h.declare_recoveries(
-            &mut rt,
+            &rt,
             dl_idx,
             p_idx,
             BitField::try_from_bits([one_sector[0].sector_number]).unwrap(),
-            BigInt::zero(),
+            TokenAmount::zero(),
         ),
     );
 
@@ -104,7 +105,7 @@ fn recovery_must_pay_back_fee_debt() {
     let funds = &ff + st.initial_pledge + st.locked_funds + st.pre_commit_deposits;
     rt.set_balance(funds);
     h.declare_recoveries(
-        &mut rt,
+        &rt,
         dl_idx,
         p_idx,
         BitField::try_from_bits([one_sector[0].sector_number]).unwrap(),
@@ -116,21 +117,21 @@ fn recovery_must_pay_back_fee_debt() {
     let p = dl.load_partition(&rt.store, p_idx).unwrap();
     assert_eq!(p.faults, p.recoveries);
     st = h.get_state(&rt);
-    assert_eq!(BigInt::zero(), st.fee_debt);
+    assert!(st.fee_debt.is_zero());
     h.check_state(&rt);
 }
 
 #[test]
 fn recovery_fails_during_active_consensus_fault() {
-    let (mut h, mut rt) = setup();
+    let (mut h, rt) = setup();
     let one_sector =
-        h.commit_and_prove_sectors(&mut rt, 1, DEFAULT_SECTOR_EXPIRATION as u64, vec![], true);
+        h.commit_and_prove_sectors(&rt, 1, DEFAULT_SECTOR_EXPIRATION as u64, vec![], true);
 
     // consensus fault
-    let test_addr = Address::new_actor("satoshi".as_bytes());
-    let epoch = rt.epoch;
+    let test_addr = Address::new_id(1234);
+    let epoch = *rt.epoch.borrow();
     h.report_consensus_fault(
-        &mut rt,
+        &rt,
         test_addr,
         Some(ConsensusFault {
             target: h.receiver,
@@ -141,10 +142,10 @@ fn recovery_fails_during_active_consensus_fault() {
     .unwrap();
 
     // advance to first proving period and submit so we'll have time to declare the fault next cycle
-    h.advance_and_submit_posts(&mut rt, &one_sector);
+    h.advance_and_submit_posts(&rt, &one_sector);
 
     // Declare the sector as faulted
-    h.declare_faults(&mut rt, &one_sector);
+    h.declare_faults(&rt, &one_sector);
     let st = h.get_state(&rt);
     let (dl_idx, p_idx) =
         st.find_sector(&rt.policy, &rt.store, one_sector[0].sector_number).unwrap();
@@ -152,11 +153,11 @@ fn recovery_fails_during_active_consensus_fault() {
         ExitCode::USR_FORBIDDEN,
         "recovery not allowed during active consensus fault",
         h.declare_recoveries(
-            &mut rt,
+            &rt,
             dl_idx,
             p_idx,
             BitField::try_from_bits([one_sector[0].sector_number]).unwrap(),
-            BigInt::zero(),
+            TokenAmount::zero(),
         ),
     );
     h.check_state(&rt);
@@ -164,9 +165,9 @@ fn recovery_fails_during_active_consensus_fault() {
 
 fn setup() -> (ActorHarness, MockRuntime) {
     let h = ActorHarness::new(PERIOD_OFFSET);
-    let mut rt = h.new_runtime();
-    h.construct_and_verify(&mut rt);
-    rt.set_balance(TokenAmount::from(BIG_BALANCE));
+    let rt = h.new_runtime();
+    h.construct_and_verify(&rt);
+    rt.set_balance(BIG_BALANCE.clone());
 
     (h, rt)
 }

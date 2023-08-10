@@ -1,4 +1,4 @@
-# Built-in Filecoin actors (v8)
+# Built-in Filecoin actors
 
 This repo contains the code for the on-chain built-in actors that power the
 Filecoin network starting from network version 16.
@@ -35,18 +35,7 @@ characteristics:
   entry represents a built-in actor.
 - Manifest keys (CID) point to the Wasm bytecode of an actor as a single block.
 - Manifest values (i32) identify the actor type, to be parsed as the
-  `fvm_shared::actor::builtin::Type` enum:
-    - System = 1
-    - Init = 2
-    - Cron = 3
-    - Account = 4
-    - Power = 5
-    - Miner = 6
-    - Market = 7
-    - PaymentChannel = 8
-    - Multisig = 9
-    - Reward = 10
-    - VerifiedRegistry = 11
+  `runtime::builtins::Type` enum.
 
 Precompiled actor bundles are provided as [release binaries][releases] in this repo. The
 [`fil_builtin_actors_bundle`](https://crates.io/crates/fil_builtin_actors_bundle) crate on
@@ -230,3 +219,6 @@ of the implementation or project they identify with.
 
 Dual-licensed: [MIT](./LICENSE-MIT), [Apache Software License v2](./LICENSE-APACHE), by way of the
 [Permissive License Stack](https://protocol.ai/blog/announcing-the-permissive-license-stack/).
+
+Except the EVM precompile [test data](actors/evm/precompile-testdata), which is licensed under the
+LGPL v3 and not included in crates or build artifacts.

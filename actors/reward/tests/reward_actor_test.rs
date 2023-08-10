@@ -1,6 +1,8 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
+use std::cell::RefCell;
+
 use fil_actor_reward::{
     ext, Actor as RewardActor, AwardBlockRewardParams, Method, State, ThisEpochRewardReturn,
     BASELINE_INITIAL_VALUE, PENALTY_MULTIPLIER,
@@ -11,7 +13,7 @@ use fil_actors_runtime::{
     ActorError, BURNT_FUNDS_ACTOR_ADDR, REWARD_ACTOR_ADDR, STORAGE_POWER_ACTOR_ADDR,
     SYSTEM_ACTOR_ADDR,
 };
-use fvm_ipld_encoding::RawBytes;
+use fvm_ipld_encoding::ipld_block::IpldBlock;
 use fvm_shared::address::Address;
 use fvm_shared::bigint::bigint_ser::BigIntSer;
 use fvm_shared::clock::ChainEpoch;
@@ -24,11 +26,13 @@ use num_traits::FromPrimitive;
 
 lazy_static! {
     static ref EPOCH_ZERO_REWARD: TokenAmount =
-        TokenAmount::from_i128(36_266_264_293_777_134_739).unwrap();
+        TokenAmount::from_atto(36_266_264_293_777_134_739i128);
     static ref WINNER: Address = Address::new_id(1000);
 }
 
 mod construction_tests {
+    use num::Zero;
+
     use super::*;
 
     #[test]
@@ -53,7 +57,7 @@ mod construction_tests {
         let state: State = rt.get_state();
         assert_eq!(ChainEpoch::from(0), state.epoch);
         assert_eq!(start_realized_power, state.cumsum_realized);
-        assert_ne!(TokenAmount::from(0), state.this_epoch_reward);
+        assert_ne!(TokenAmount::zero(), state.this_epoch_reward);
     }
 
     #[test]
@@ -74,173 +78,168 @@ mod construction_tests {
 }
 
 mod test_award_block_reward {
-    use fvm_ipld_encoding::RawBytes;
+    use fvm_ipld_encoding::ipld_block::IpldBlock;
     use fvm_shared::error::ExitCode;
     use fvm_shared::sector::StoragePower;
     use fvm_shared::METHOD_SEND;
+    use num::Zero;
 
     use super::*;
 
     #[test]
     fn rejects_gas_reward_exceeding_balance() {
-        let mut rt = construct_and_verify(&StoragePower::default());
+        let rt = construct_and_verify(&StoragePower::default());
 
-        rt.set_balance(TokenAmount::from(9));
-        rt.expect_validate_caller_addr(vec![*SYSTEM_ACTOR_ADDR]);
-        assert_eq!(
-            ExitCode::USR_ILLEGAL_STATE,
-            award_block_reward(
-                &mut rt,
-                *WINNER,
-                TokenAmount::from(0),
-                TokenAmount::from(10),
-                1,
-                TokenAmount::from(0)
-            )
-            .unwrap_err()
-            .exit_code()
-        );
+        rt.set_balance(TokenAmount::from_atto(9));
+        rt.expect_validate_caller_addr(vec![SYSTEM_ACTOR_ADDR]);
+
+        let params = IpldBlock::serialize_cbor(&AwardBlockRewardParams {
+            miner: *WINNER,
+            penalty: TokenAmount::zero(),
+            gas_reward: TokenAmount::from_atto(10),
+            win_count: 1,
+        })
+        .unwrap();
+        let result = rt.call::<RewardActor>(Method::AwardBlockReward as u64, params);
+
+        expect_abort(ExitCode::USR_ILLEGAL_STATE, result);
     }
 
     #[test]
     fn rejects_negative_penalty_or_reward() {
-        let mut rt = construct_and_verify(&StoragePower::default());
-        rt.set_balance(TokenAmount::from(10_i128.pow(18)));
-        rt.expect_validate_caller_addr(vec![*SYSTEM_ACTOR_ADDR]);
+        let rt = construct_and_verify(&StoragePower::default());
+        rt.set_balance(TokenAmount::from_whole(1));
 
         let reward_penalty_pairs = [(-1, 0), (0, -1)];
 
         for (reward, penalty) in &reward_penalty_pairs {
-            assert_eq!(
-                ExitCode::USR_ILLEGAL_ARGUMENT,
-                award_block_reward(
-                    &mut rt,
-                    *WINNER,
-                    TokenAmount::from(*penalty),
-                    TokenAmount::from(*reward),
-                    1,
-                    TokenAmount::from(0)
-                )
-                .unwrap_err()
-                .exit_code()
-            );
+            rt.expect_validate_caller_addr(vec![SYSTEM_ACTOR_ADDR]);
+
+            let params = IpldBlock::serialize_cbor(&AwardBlockRewardParams {
+                miner: *WINNER,
+                penalty: TokenAmount::from_atto(*penalty),
+                gas_reward: TokenAmount::from_atto(*reward),
+                win_count: 1,
+            })
+            .unwrap();
+            let result = rt.call::<RewardActor>(Method::AwardBlockReward as u64, params);
+
+            expect_abort(ExitCode::USR_ILLEGAL_ARGUMENT, result);
             rt.reset();
         }
     }
 
     #[test]
     fn rejects_zero_wincount() {
-        let mut rt = construct_and_verify(&StoragePower::default());
-        rt.set_balance(TokenAmount::from(10_i128.pow(18)));
+        let rt = construct_and_verify(&StoragePower::default());
+        rt.set_balance(TokenAmount::from_whole(1));
 
-        rt.expect_validate_caller_addr(vec![*SYSTEM_ACTOR_ADDR]);
-        assert!(award_block_reward(
-            &mut rt,
-            *WINNER,
-            TokenAmount::from(0),
-            TokenAmount::from(0),
-            0,
-            TokenAmount::from(0)
-        )
-        .is_err());
-        rt.reset();
+        rt.expect_validate_caller_addr(vec![SYSTEM_ACTOR_ADDR]);
+
+        let params = IpldBlock::serialize_cbor(&AwardBlockRewardParams {
+            miner: *WINNER,
+            penalty: TokenAmount::zero(),
+            gas_reward: TokenAmount::zero(),
+            win_count: 0,
+        })
+        .unwrap();
+        let result = rt.call::<RewardActor>(Method::AwardBlockReward as u64, params);
+
+        assert!(result.is_err());
     }
 
     #[test]
     fn pays_reward_and_tracks_penalty() {
-        let mut rt = construct_and_verify(&StoragePower::default());
-        rt.set_balance(TokenAmount::from(10_i128.pow(27)));
-        rt.expect_validate_caller_addr(vec![*SYSTEM_ACTOR_ADDR]);
-        let penalty: TokenAmount = TokenAmount::from(100);
-        let gas_reward: TokenAmount = TokenAmount::from(200);
+        let rt = construct_and_verify(&StoragePower::default());
+        rt.set_balance(TokenAmount::from_whole(1_000_000_000));
+        rt.expect_validate_caller_addr(vec![SYSTEM_ACTOR_ADDR]);
+        let penalty: TokenAmount = TokenAmount::from_atto(100);
+        let gas_reward: TokenAmount = TokenAmount::from_atto(200);
         let expected_reward: TokenAmount =
-            &*EPOCH_ZERO_REWARD / EXPECTED_LEADERS_PER_EPOCH + &gas_reward;
+            EPOCH_ZERO_REWARD.div_floor(EXPECTED_LEADERS_PER_EPOCH) + &gas_reward;
         let miner_penalty = PENALTY_MULTIPLIER * &penalty;
-        let params = RawBytes::serialize(&ext::miner::ApplyRewardParams {
+        let params = IpldBlock::serialize_cbor(&ext::miner::ApplyRewardParams {
             reward: expected_reward.clone(),
             penalty: miner_penalty,
         })
         .unwrap();
-        rt.expect_send(
+        rt.expect_send_simple(
             *WINNER,
             ext::miner::APPLY_REWARDS_METHOD,
             params,
             expected_reward,
-            RawBytes::default(),
+            None,
             ExitCode::OK,
         );
-        let params = AwardBlockRewardParams { miner: *WINNER, penalty, gas_reward, win_count: 1 };
-        assert!(rt
-            .call::<RewardActor>(
-                Method::AwardBlockReward as u64,
-                &RawBytes::serialize(params).unwrap()
-            )
-            .is_ok());
+        let inner_params = IpldBlock::serialize_cbor(&AwardBlockRewardParams {
+            miner: *WINNER,
+            penalty,
+            gas_reward,
+            win_count: 1,
+        })
+        .unwrap();
+        assert!(rt.call::<RewardActor>(Method::AwardBlockReward as u64, inner_params).is_ok());
         rt.verify();
         rt.reset();
     }
 
     #[test]
     fn pays_out_current_balance_when_reward_exceeds_total_balance() {
-        let mut rt = construct_and_verify(&StoragePower::from(1));
+        let rt = construct_and_verify(&StoragePower::from(1));
 
         // Total reward is a huge number, upon writing ~1e18, so 300 should be way less
-        let small_reward = TokenAmount::from(300);
-        let penalty = TokenAmount::from(100);
+        let small_reward = TokenAmount::from_atto(300);
+        let penalty = TokenAmount::from_atto(100);
         rt.set_balance(small_reward.clone());
-        rt.expect_validate_caller_addr(vec![*SYSTEM_ACTOR_ADDR]);
+        rt.expect_validate_caller_addr(vec![SYSTEM_ACTOR_ADDR]);
 
         let miner_penalty = PENALTY_MULTIPLIER * &penalty;
-        let params = RawBytes::serialize(&ext::miner::ApplyRewardParams {
+        let params = IpldBlock::serialize_cbor(&ext::miner::ApplyRewardParams {
             reward: small_reward.clone(),
             penalty: miner_penalty,
         })
         .unwrap();
-        rt.expect_send(
+        rt.expect_send_simple(
             *WINNER,
             ext::miner::APPLY_REWARDS_METHOD,
             params,
             small_reward,
-            RawBytes::default(),
+            None,
             ExitCode::OK,
         );
 
-        let params = AwardBlockRewardParams {
+        let inner_params = IpldBlock::serialize_cbor(&AwardBlockRewardParams {
             miner: *WINNER,
             penalty,
-            gas_reward: TokenAmount::from(0),
+            gas_reward: TokenAmount::zero(),
             win_count: 1,
-        };
-        assert!(rt
-            .call::<RewardActor>(
-                Method::AwardBlockReward as u64,
-                &RawBytes::serialize(params).unwrap()
-            )
-            .is_ok());
+        })
+        .unwrap();
+        assert!(rt.call::<RewardActor>(Method::AwardBlockReward as u64, inner_params).is_ok());
         rt.verify();
     }
 
     #[test]
     fn total_mined_tracks_correctly() {
-        let mut rt = construct_and_verify(&StoragePower::from(1));
+        let rt = construct_and_verify(&StoragePower::from(1));
         let mut state: State = rt.get_state();
 
-        assert_eq!(TokenAmount::from(0), state.total_storage_power_reward);
-        state.this_epoch_reward = TokenAmount::from(5000);
+        assert_eq!(TokenAmount::zero(), state.total_storage_power_reward);
+        state.this_epoch_reward = TokenAmount::from_atto(5000);
 
         rt.replace_state(&state);
 
-        let total_payout = TokenAmount::from(3500);
+        let total_payout = TokenAmount::from_atto(3500);
         rt.set_balance(total_payout.clone());
 
         for i in &[1000, 1000, 1000, 500] {
             assert!(award_block_reward(
-                &mut rt,
+                &rt,
                 *WINNER,
-                TokenAmount::from(0),
-                TokenAmount::from(0),
+                TokenAmount::zero(),
+                TokenAmount::zero(),
                 1,
-                TokenAmount::from(*i)
+                TokenAmount::from_atto(*i),
             )
             .is_ok());
         }
@@ -251,53 +250,49 @@ mod test_award_block_reward {
 
     #[test]
     fn funds_are_sent_to_burnt_funds_actor_if_sending_locked_funds_to_miner_fails() {
-        let mut rt = construct_and_verify(&StoragePower::from(1));
+        let rt = construct_and_verify(&StoragePower::from(1));
         let mut state: State = rt.get_state();
 
-        assert_eq!(TokenAmount::from(0), state.total_storage_power_reward);
-        state.this_epoch_reward = TokenAmount::from(5000);
+        assert_eq!(TokenAmount::zero(), state.total_storage_power_reward);
+        state.this_epoch_reward = TokenAmount::from_atto(5000);
         rt.replace_state(&state);
         // enough balance to pay 3 full rewards and one partial
-        rt.set_balance(TokenAmount::from(3500));
+        rt.set_balance(TokenAmount::from_atto(3500));
 
-        rt.expect_validate_caller_addr(vec![*SYSTEM_ACTOR_ADDR]);
-        let expected_reward = TokenAmount::from(1000);
-        let miner_penalty = TokenAmount::from(0);
-        let params = RawBytes::serialize(&ext::miner::ApplyRewardParams {
+        rt.expect_validate_caller_addr(vec![SYSTEM_ACTOR_ADDR]);
+        let expected_reward = TokenAmount::from_atto(1000);
+        let miner_penalty = TokenAmount::zero();
+        let params = IpldBlock::serialize_cbor(&ext::miner::ApplyRewardParams {
             reward: expected_reward.clone(),
             penalty: miner_penalty,
         })
         .unwrap();
-        rt.expect_send(
+        rt.expect_send_simple(
             *WINNER,
             ext::miner::APPLY_REWARDS_METHOD,
             params,
             expected_reward.clone(),
-            RawBytes::default(),
+            None,
             ExitCode::USR_FORBIDDEN,
         );
-        rt.expect_send(
-            *BURNT_FUNDS_ACTOR_ADDR,
+        rt.expect_send_simple(
+            BURNT_FUNDS_ACTOR_ADDR,
             METHOD_SEND,
-            RawBytes::default(),
+            None,
             expected_reward,
-            RawBytes::default(),
+            None,
             ExitCode::OK,
         );
 
-        let params = AwardBlockRewardParams {
+        let inner_params = IpldBlock::serialize_cbor(&AwardBlockRewardParams {
             miner: *WINNER,
-            penalty: TokenAmount::from(0),
-            gas_reward: TokenAmount::from(0),
+            penalty: TokenAmount::zero(),
+            gas_reward: TokenAmount::zero(),
             win_count: 1,
-        };
+        })
+        .unwrap();
 
-        assert!(rt
-            .call::<RewardActor>(
-                Method::AwardBlockReward as u64,
-                &RawBytes::serialize(params).unwrap()
-            )
-            .is_ok());
+        assert!(rt.call::<RewardActor>(Method::AwardBlockReward as u64, inner_params).is_ok());
 
         rt.verify();
     }
@@ -308,11 +303,11 @@ mod test_this_epoch_reward {
 
     #[test]
     fn successfully_fetch_reward_for_this_epoch() {
-        let mut rt = construct_and_verify(&StoragePower::from(1));
+        let rt = construct_and_verify(&StoragePower::from(1));
 
         let state: State = rt.get_state();
 
-        let resp: ThisEpochRewardReturn = this_epoch_reward(&mut rt);
+        let resp: ThisEpochRewardReturn = this_epoch_reward(&rt);
 
         assert_eq!(state.this_epoch_baseline_power, resp.this_epoch_baseline_power);
         assert_eq!(state.this_epoch_reward_smoothed, resp.this_epoch_reward_smoothed);
@@ -322,92 +317,96 @@ mod test_this_epoch_reward {
 #[test]
 fn test_successive_kpi_updates() {
     let power = StoragePower::from_i128(1 << 50).unwrap();
-    let mut rt = construct_and_verify(&power);
+    let rt = construct_and_verify(&power);
 
     for i in &[1, 2, 3] {
-        rt.epoch = ChainEpoch::from(*i);
-        update_network_kpi(&mut rt, &power);
+        rt.epoch.replace(ChainEpoch::from(*i));
+        update_network_kpi(&rt, &power);
     }
 }
 
 fn construct_and_verify(curr_power: &StoragePower) -> MockRuntime {
-    let mut rt = MockRuntime {
-        receiver: *REWARD_ACTOR_ADDR,
-        caller: *SYSTEM_ACTOR_ADDR,
-        caller_type: *SYSTEM_ACTOR_CODE_ID,
+    let rt = MockRuntime {
+        receiver: REWARD_ACTOR_ADDR,
+        caller: RefCell::new(SYSTEM_ACTOR_ADDR),
+        caller_type: RefCell::new(*SYSTEM_ACTOR_CODE_ID),
         ..Default::default()
     };
-    rt.expect_validate_caller_addr(vec![*SYSTEM_ACTOR_ADDR]);
+    rt.set_caller(*SYSTEM_ACTOR_CODE_ID, SYSTEM_ACTOR_ADDR);
+    rt.expect_validate_caller_addr(vec![SYSTEM_ACTOR_ADDR]);
     let ret = rt
         .call::<RewardActor>(
             METHOD_CONSTRUCTOR,
-            &RawBytes::serialize(BigIntSer(curr_power)).unwrap(),
+            IpldBlock::serialize_cbor(&(BigIntSer(curr_power))).unwrap(),
         )
         .unwrap();
 
-    assert_eq!(RawBytes::default(), ret);
+    assert!(ret.is_none());
     rt.verify();
     rt
 }
 
 fn award_block_reward(
-    rt: &mut MockRuntime,
+    rt: &MockRuntime,
     miner: Address,
     penalty: TokenAmount,
     gas_reward: TokenAmount,
     win_count: i64,
     expected_payment: TokenAmount,
-) -> Result<RawBytes, ActorError> {
-    rt.expect_validate_caller_addr(vec![*SYSTEM_ACTOR_ADDR]);
+) -> Result<Option<IpldBlock>, ActorError> {
+    rt.expect_validate_caller_addr(vec![SYSTEM_ACTOR_ADDR]);
     let miner_penalty = &penalty * PENALTY_MULTIPLIER;
-    rt.expect_send(
+    rt.expect_send_simple(
         miner,
         ext::miner::APPLY_REWARDS_METHOD,
-        RawBytes::serialize(&ext::miner::ApplyRewardParams {
+        IpldBlock::serialize_cbor(&ext::miner::ApplyRewardParams {
             reward: expected_payment.clone(),
             penalty: miner_penalty,
         })
         .unwrap(),
         expected_payment.clone(),
-        RawBytes::default(),
+        None,
         ExitCode::OK,
     );
 
-    if penalty > TokenAmount::from(0) {
-        rt.expect_send(
-            *BURNT_FUNDS_ACTOR_ADDR,
+    if penalty.is_positive() {
+        rt.expect_send_simple(
+            BURNT_FUNDS_ACTOR_ADDR,
             METHOD_SEND,
-            RawBytes::default(),
+            None,
             expected_payment,
-            RawBytes::default(),
+            None,
             ExitCode::OK,
         );
     }
 
-    let params =
-        RawBytes::serialize(AwardBlockRewardParams { miner, penalty, gas_reward, win_count })
-            .unwrap();
+    let params = IpldBlock::serialize_cbor(&AwardBlockRewardParams {
+        miner,
+        penalty,
+        gas_reward,
+        win_count,
+    })
+    .unwrap();
 
-    let serialized_bytes = rt.call::<RewardActor>(Method::AwardBlockReward as u64, &params)?;
+    let serialized_bytes = rt.call::<RewardActor>(Method::AwardBlockReward as u64, params)?;
 
     rt.verify();
     Ok(serialized_bytes)
 }
 
-fn this_epoch_reward(rt: &mut MockRuntime) -> ThisEpochRewardReturn {
+fn this_epoch_reward(rt: &MockRuntime) -> ThisEpochRewardReturn {
     rt.expect_validate_caller_any();
-    let serialized_result =
-        rt.call::<RewardActor>(Method::ThisEpochReward as u64, &RawBytes::default()).unwrap();
-    let resp: ThisEpochRewardReturn = RawBytes::deserialize(&serialized_result).unwrap();
+    let serialized_result = rt.call::<RewardActor>(Method::ThisEpochReward as u64, None).unwrap();
+    let resp: ThisEpochRewardReturn = serialized_result.unwrap().deserialize().unwrap();
     rt.verify();
     resp
 }
 
-fn update_network_kpi(rt: &mut MockRuntime, curr_raw_power: &StoragePower) {
-    rt.set_caller(*POWER_ACTOR_CODE_ID, *STORAGE_POWER_ACTOR_ADDR);
-    rt.expect_validate_caller_addr(vec![*STORAGE_POWER_ACTOR_ADDR]);
+fn update_network_kpi(rt: &MockRuntime, curr_raw_power: &StoragePower) {
+    rt.set_caller(*POWER_ACTOR_CODE_ID, STORAGE_POWER_ACTOR_ADDR);
+    rt.expect_validate_caller_addr(vec![STORAGE_POWER_ACTOR_ADDR]);
 
-    let params = &RawBytes::serialize(BigIntSer(curr_raw_power)).unwrap();
+    let params = IpldBlock::serialize_cbor(&(BigIntSer(curr_raw_power))).unwrap();
     assert!(rt.call::<RewardActor>(Method::UpdateNetworkKPI as u64, params).is_ok());
     rt.verify();
 }

@@ -6,16 +6,17 @@ use std::convert::TryInto;
 
 use anyhow::anyhow;
 use ext::init;
+use fil_actors_runtime::runtime::builtins::Type;
 use fil_actors_runtime::runtime::{ActorCode, Runtime};
 use fil_actors_runtime::{
-    actor_error, cbor, make_map_with_root_and_bitwidth, ActorDowncast, ActorError, Multimap,
-    CRON_ACTOR_ADDR, INIT_ACTOR_ADDR, REWARD_ACTOR_ADDR, SYSTEM_ACTOR_ADDR,
+    actor_dispatch, actor_error, deserialize_block, extract_send_result,
+    make_map_with_root_and_bitwidth, ActorDowncast, ActorError, Multimap, CRON_ACTOR_ADDR,
+    INIT_ACTOR_ADDR, REWARD_ACTOR_ADDR, SYSTEM_ACTOR_ADDR,
 };
-use fvm_ipld_blockstore::Blockstore;
+use fvm_ipld_encoding::ipld_block::IpldBlock;
 use fvm_ipld_encoding::RawBytes;
-use fvm_shared::actor::builtin::{Type, CALLER_TYPES_SIGNABLE};
 use fvm_shared::address::Address;
-use fvm_shared::bigint::bigint_ser::{BigIntDe, BigIntSer};
+use fvm_shared::bigint::bigint_ser::BigIntSer;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::ExitCode;
 use fvm_shared::reward::ThisEpochRewardReturn;
@@ -23,7 +24,7 @@ use fvm_shared::sector::SealVerifyInfo;
 use fvm_shared::{MethodNum, HAMT_BIT_WIDTH, METHOD_CONSTRUCTOR};
 use log::{debug, error};
 use num_derive::FromPrimitive;
-use num_traits::{FromPrimitive, Signed, Zero};
+use num_traits::Zero;
 
 pub use self::policy::*;
 pub use self::state::*;
@@ -62,20 +63,23 @@ pub enum Method {
     // OnConsensusFault = 7,
     SubmitPoRepForBulkVerify = 8,
     CurrentTotalPower = 9,
+    // Method numbers derived from FRC-0042 standards
+    CreateMinerExported = frc42_dispatch::method_hash!("CreateMiner"),
+    NetworkRawPowerExported = frc42_dispatch::method_hash!("NetworkRawPower"),
+    MinerRawPowerExported = frc42_dispatch::method_hash!("MinerRawPower"),
+    MinerCountExported = frc42_dispatch::method_hash!("MinerCount"),
+    MinerConsensusCountExported = frc42_dispatch::method_hash!("MinerConsensusCount"),
 }
 
 pub const ERR_TOO_MANY_PROVE_COMMITS: ExitCode = ExitCode::new(32);
 
 /// Storage Power Actor
 pub struct Actor;
+
 impl Actor {
     /// Constructor for StoragePower actor
-    fn constructor<BS, RT>(rt: &mut RT) -> Result<(), ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
-        rt.validate_immediate_caller_is(std::iter::once(&*SYSTEM_ACTOR_ADDR))?;
+    fn constructor(rt: &impl Runtime) -> Result<(), ActorError> {
+        rt.validate_immediate_caller_is(std::iter::once(&SYSTEM_ACTOR_ADDR))?;
 
         let st = State::new(rt.store()).map_err(|e| {
             e.downcast_default(ExitCode::USR_ILLEGAL_STATE, "Failed to create power actor state")
@@ -84,15 +88,11 @@ impl Actor {
         Ok(())
     }
 
-    fn create_miner<BS, RT>(
-        rt: &mut RT,
+    fn create_miner(
+        rt: &impl Runtime,
         params: CreateMinerParams,
-    ) -> Result<CreateMinerReturn, ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
-        rt.validate_immediate_caller_type(CALLER_TYPES_SIGNABLE.iter())?;
+    ) -> Result<CreateMinerReturn, ActorError> {
+        rt.validate_immediate_caller_accept_any()?;
         let value = rt.message().value_received();
 
         let constructor_params = RawBytes::serialize(ext::miner::MinerConstructorParams {
@@ -105,17 +105,16 @@ impl Actor {
         })?;
 
         let miner_actor_code_cid = rt.get_code_cid_for_type(Type::Miner);
-        let ext::init::ExecReturn { id_address, robust_address } = rt
-            .send(
-                *INIT_ACTOR_ADDR,
+        let ext::init::ExecReturn { id_address, robust_address } =
+            deserialize_block(extract_send_result(rt.send_simple(
+                &INIT_ACTOR_ADDR,
                 ext::init::EXEC_METHOD,
-                RawBytes::serialize(init::ExecParams {
+                IpldBlock::serialize_cbor(&init::ExecParams {
                     code_cid: miner_actor_code_cid,
                     constructor_params,
                 })?,
                 value,
-            )?
-            .deserialize()?;
+            ))?)?;
 
         let window_post_proof_type = params.window_post_proof_type;
         rt.transaction(|st: &mut State, rt| {
@@ -154,19 +153,16 @@ impl Actor {
             })?;
             Ok(())
         })?;
+        println!("12345");
         Ok(CreateMinerReturn { id_address, robust_address })
     }
 
     /// Adds or removes claimed power for the calling actor.
     /// May only be invoked by a miner actor.
-    fn update_claimed_power<BS, RT>(
-        rt: &mut RT,
+    fn update_claimed_power(
+        rt: &impl Runtime,
         params: UpdateClaimedPowerParams,
-    ) -> Result<(), ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
+    ) -> Result<(), ActorError> {
         rt.validate_immediate_caller_type(std::iter::once(&Type::Miner))?;
         let miner_addr = rt.message().caller();
 
@@ -200,14 +196,10 @@ impl Actor {
         })
     }
 
-    fn enroll_cron_event<BS, RT>(
-        rt: &mut RT,
+    fn enroll_cron_event(
+        rt: &impl Runtime,
         params: EnrollCronEventParams,
-    ) -> Result<(), ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
+    ) -> Result<(), ActorError> {
         rt.validate_immediate_caller_type(std::iter::once(&Type::Miner))?;
         let miner_event = CronEvent {
             miner_addr: rt.message().caller(),
@@ -244,27 +236,23 @@ impl Actor {
         Ok(())
     }
 
-    fn on_epoch_tick_end<BS, RT>(rt: &mut RT) -> Result<(), ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
-        rt.validate_immediate_caller_is(std::iter::once(&*CRON_ACTOR_ADDR))?;
+    fn on_epoch_tick_end(rt: &impl Runtime) -> Result<(), ActorError> {
+        rt.validate_immediate_caller_is(std::iter::once(&CRON_ACTOR_ADDR))?;
 
-        let rewret: ThisEpochRewardReturn = rt
-            .send(
-                *REWARD_ACTOR_ADDR,
+        let rewret: ThisEpochRewardReturn = deserialize_block(
+            extract_send_result(rt.send_simple(
+                &REWARD_ACTOR_ADDR,
                 ext::reward::Method::ThisEpochReward as MethodNum,
-                RawBytes::default(),
+                None,
                 TokenAmount::zero(),
-            )
-            .map_err(|e| e.wrap("failed to check epoch baseline power"))?
-            .deserialize()?;
+            ))
+            .map_err(|e| e.wrap("failed to check epoch baseline power"))?,
+        )?;
 
         if let Err(e) = Self::process_batch_proof_verifies(rt, &rewret) {
             error!("unexpected error processing batch proof verifies: {}. Skipping all verification for epoch {}", e, rt.curr_epoch());
         }
-        Self::process_deferred_cron_events(rt, rewret.clone())?;
+        Self::process_deferred_cron_events(rt, rewret)?;
 
         let this_epoch_raw_byte_power = rt.transaction(|st: &mut State, _| {
             let (raw_byte_power, qa_power) = st.current_total_power();
@@ -274,30 +262,29 @@ impl Actor {
             // Can assume delta is one since cron is invoked every epoch.
             st.update_smoothed_estimate(1);
 
-            Ok(RawBytes::serialize(&BigIntSer(&st.this_epoch_raw_byte_power)))
+            Ok(IpldBlock::serialize_cbor(&BigIntSer(&st.this_epoch_raw_byte_power))?)
         })?;
 
         // Update network KPA in reward actor
-        rt.send(
-            *REWARD_ACTOR_ADDR,
+        extract_send_result(rt.send_simple(
+            &REWARD_ACTOR_ADDR,
             ext::reward::UPDATE_NETWORK_KPI,
-            this_epoch_raw_byte_power?,
-            TokenAmount::from(0_u32),
-        )
+            this_epoch_raw_byte_power,
+            TokenAmount::zero(),
+        ))
         .map_err(|e| e.wrap("failed to update network KPI with reward actor"))?;
 
         Ok(())
     }
 
-    fn update_pledge_total<BS, RT>(rt: &mut RT, pledge_delta: TokenAmount) -> Result<(), ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
+    fn update_pledge_total(
+        rt: &impl Runtime,
+        params: UpdatePledgeTotalParams,
+    ) -> Result<(), ActorError> {
         rt.validate_immediate_caller_type(std::iter::once(&Type::Miner))?;
         rt.transaction(|st: &mut State, rt| {
             st.validate_miner_has_claim(rt.store(), &rt.message().caller())?;
-            st.add_pledge_total(pledge_delta);
+            st.add_pledge_total(params.pledge_delta);
             if st.total_pledge_collateral.is_negative() {
                 return Err(actor_error!(
                     illegal_state,
@@ -309,14 +296,10 @@ impl Actor {
         })
     }
 
-    fn submit_porep_for_bulk_verify<BS, RT>(
-        rt: &mut RT,
-        seal_info: SealVerifyInfo,
-    ) -> Result<(), ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
+    fn submit_porep_for_bulk_verify(
+        rt: &impl Runtime,
+        params: SubmitPoRepForBulkVerifyParams,
+    ) -> Result<(), ActorError> {
         rt.validate_immediate_caller_type(std::iter::once(&Type::Miner))?;
 
         rt.transaction(|st: &mut State, rt| {
@@ -358,7 +341,7 @@ impl Actor {
                 }
             }
 
-            mmap.add(miner_addr.to_bytes().into(), seal_info).map_err(|e| {
+            mmap.add(miner_addr.to_bytes().into(), params.seal_info).map_err(|e| {
                 e.downcast_default(ExitCode::USR_ILLEGAL_STATE, "failed to insert proof into set")
             })?;
 
@@ -378,11 +361,7 @@ impl Actor {
     /// The returned values are frozen during the cron tick before this epoch
     /// so that this method returns consistent values while processing all messages
     /// of an epoch.
-    fn current_total_power<BS, RT>(rt: &mut RT) -> Result<CurrentTotalPowerReturn, ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
+    fn current_total_power(rt: &impl Runtime) -> Result<CurrentTotalPowerReturn, ActorError> {
         rt.validate_immediate_caller_accept_any()?;
         let st: State = rt.state()?;
 
@@ -394,27 +373,72 @@ impl Actor {
         })
     }
 
-    fn process_batch_proof_verifies<BS, RT>(
-        rt: &mut RT,
+    /// Returns the total raw power of the network.
+    /// This is defined as the sum of the active (i.e. non-faulty) byte commitments
+    /// of all miners that have more than the consensus minimum amount of storage active.
+    /// This value is static over an epoch, and does NOT get updated as messages are executed.
+    /// It is recalculated after all messages at an epoch have been executed.
+    fn network_raw_power(rt: &impl Runtime) -> Result<NetworkRawPowerReturn, ActorError> {
+        rt.validate_immediate_caller_accept_any()?;
+        let st: State = rt.state()?;
+
+        Ok(NetworkRawPowerReturn { raw_byte_power: st.this_epoch_raw_byte_power })
+    }
+
+    /// Returns the raw power claimed by the specified miner,
+    /// and whether the miner has more than the consensus minimum amount of storage active.
+    /// The raw power is defined as the active (i.e. non-faulty) byte commitments of the miner.
+    fn miner_raw_power(
+        rt: &impl Runtime,
+        params: MinerRawPowerParams,
+    ) -> Result<MinerRawPowerReturn, ActorError> {
+        rt.validate_immediate_caller_accept_any()?;
+        let st: State = rt.state()?;
+
+        let (raw_byte_power, meets_consensus_minimum) =
+            st.miner_nominal_power_meets_consensus_minimum(rt.policy(), rt.store(), params.miner)?;
+
+        Ok(MinerRawPowerReturn { raw_byte_power, meets_consensus_minimum })
+    }
+
+    /// Returns the total number of miners created, regardless of whether or not
+    /// they have any pledged storage.
+    fn miner_count(rt: &impl Runtime) -> Result<MinerCountReturn, ActorError> {
+        rt.validate_immediate_caller_accept_any()?;
+        let st: State = rt.state()?;
+
+        Ok(MinerCountReturn { miner_count: st.miner_count })
+    }
+
+    /// Returns the total number of miners that have more than the consensus minimum amount of storage active.
+    /// Active means that the storage must not be faulty.
+    fn miner_consensus_count(rt: &impl Runtime) -> Result<MinerConsensusCountReturn, ActorError> {
+        rt.validate_immediate_caller_accept_any()?;
+        let st: State = rt.state()?;
+
+        Ok(MinerConsensusCountReturn { miner_consensus_count: st.miner_above_min_power_count })
+    }
+
+    fn process_batch_proof_verifies(
+        rt: &impl Runtime,
         rewret: &ThisEpochRewardReturn,
-    ) -> Result<(), String>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
+    ) -> Result<(), String> {
         let mut miners: Vec<(Address, usize)> = Vec::new();
         let mut infos: Vec<SealVerifyInfo> = Vec::new();
         let mut st_err: Option<String> = None;
         let this_epoch_qa_power_smoothed = rt
             .transaction(|st: &mut State, rt| {
                 let result = Ok(st.this_epoch_qa_power_smoothed.clone());
-                if st.proof_validation_batch.is_none() {
-                    debug!("ProofValidationBatch was nil, quitting verification");
-                    return result;
-                }
+                let batch = match &st.proof_validation_batch {
+                    None => {
+                        debug!("ProofValidationBatch was nil, quitting verification");
+                        return result;
+                    }
+                    Some(batch) => batch,
+                };
                 let mmap = match Multimap::from_root(
                     rt.store(),
-                    st.proof_validation_batch.as_ref().unwrap(),
+                    batch,
                     HAMT_BIT_WIDTH,
                     PROOF_VALIDATION_BATCH_AMT_BITWIDTH,
                 ) {
@@ -512,17 +536,19 @@ impl Actor {
             if successful.is_empty() {
                 continue;
             }
-            if let Err(e) = rt.send(
-                m,
-                ext::miner::CONFIRM_SECTOR_PROOFS_VALID_METHOD,
-                RawBytes::serialize(&ext::miner::ConfirmSectorProofsParams {
-                    sectors: successful,
-                    reward_smoothed: rewret.this_epoch_reward_smoothed.clone(),
-                    reward_baseline_power: rewret.this_epoch_baseline_power.clone(),
-                    quality_adj_power_smoothed: this_epoch_qa_power_smoothed.clone(),
-                })
-                .map_err(|e| format!("failed to serialize ConfirmSectorProofsParams: {}", e))?,
-                Default::default(),
+            if let Err(e) = extract_send_result(
+                rt.send_simple(
+                    &m,
+                    ext::miner::CONFIRM_SECTOR_PROOFS_VALID_METHOD,
+                    IpldBlock::serialize_cbor(&ext::miner::ConfirmSectorProofsParams {
+                        sectors: successful,
+                        reward_smoothed: rewret.this_epoch_reward_smoothed.clone(),
+                        reward_baseline_power: rewret.this_epoch_baseline_power.clone(),
+                        quality_adj_power_smoothed: this_epoch_qa_power_smoothed.clone(),
+                    })
+                    .map_err(|e| format!("failed to serialize ConfirmSectorProofsParams: {}", e))?,
+                    Default::default(),
+                ),
             ) {
                 error!("failed to confirm sector proof validity to {}, error code {}", m, e);
             }
@@ -530,14 +556,10 @@ impl Actor {
         Ok(())
     }
 
-    fn process_deferred_cron_events<BS, RT>(
-        rt: &mut RT,
+    fn process_deferred_cron_events(
+        rt: &impl Runtime,
         rewret: ThisEpochRewardReturn,
-    ) -> Result<(), ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
+    ) -> Result<(), ActorError> {
         let rt_epoch = rt.curr_epoch();
         let mut cron_events = Vec::new();
         let st: State = rt.state()?;
@@ -602,17 +624,17 @@ impl Actor {
 
         let mut failed_miner_crons = Vec::new();
         for event in cron_events {
-            let params = RawBytes::serialize(ext::miner::DeferredCronEventParams {
+            let params = IpldBlock::serialize_cbor(&ext::miner::DeferredCronEventParams {
                 event_payload: event.callback_payload.bytes().to_owned(),
                 reward_smoothed: rewret.this_epoch_reward_smoothed.clone(),
                 quality_adj_power_smoothed: st.this_epoch_qa_power_smoothed.clone(),
             })?;
-            let res = rt.send(
-                event.miner_addr,
+            let res = extract_send_result(rt.send_simple(
+                &event.miner_addr,
                 ext::miner::ON_DEFERRED_CRON_EVENT_METHOD,
                 params,
                 Default::default(),
-            );
+            ));
             // If a callback fails, this actor continues to invoke other callbacks
             // and persists state removing the failed event from the event queue. It won't be tried again.
             // Failures are unexpected here but will result in removal of miner power
@@ -655,50 +677,19 @@ impl Actor {
 }
 
 impl ActorCode for Actor {
-    fn invoke_method<BS, RT>(
-        rt: &mut RT,
-        method: MethodNum,
-        params: &RawBytes,
-    ) -> Result<RawBytes, ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
-        match FromPrimitive::from_u64(method) {
-            Some(Method::Constructor) => {
-                Self::constructor(rt)?;
-                Ok(RawBytes::default())
-            }
-            Some(Method::CreateMiner) => {
-                let res = Self::create_miner(rt, cbor::deserialize_params(params)?)?;
-                Ok(RawBytes::serialize(res)?)
-            }
-            Some(Method::UpdateClaimedPower) => {
-                Self::update_claimed_power(rt, cbor::deserialize_params(params)?)?;
-                Ok(RawBytes::default())
-            }
-            Some(Method::EnrollCronEvent) => {
-                Self::enroll_cron_event(rt, cbor::deserialize_params(params)?)?;
-                Ok(RawBytes::default())
-            }
-            Some(Method::OnEpochTickEnd) => {
-                Self::on_epoch_tick_end(rt)?;
-                Ok(RawBytes::default())
-            }
-            Some(Method::UpdatePledgeTotal) => {
-                let BigIntDe(param) = cbor::deserialize_params(params)?;
-                Self::update_pledge_total(rt, param)?;
-                Ok(RawBytes::default())
-            }
-            Some(Method::SubmitPoRepForBulkVerify) => {
-                Self::submit_porep_for_bulk_verify(rt, cbor::deserialize_params(params)?)?;
-                Ok(RawBytes::default())
-            }
-            Some(Method::CurrentTotalPower) => {
-                let res = Self::current_total_power(rt)?;
-                Ok(RawBytes::serialize(res)?)
-            }
-            None => Err(actor_error!(unhandled_message; "Invalid method")),
-        }
+    type Methods = Method;
+    actor_dispatch! {
+        Constructor => constructor,
+        CreateMiner|CreateMinerExported => create_miner,
+        UpdateClaimedPower => update_claimed_power            ,
+        EnrollCronEvent => enroll_cron_event,
+        OnEpochTickEnd => on_epoch_tick_end,
+        UpdatePledgeTotal => update_pledge_total,
+        SubmitPoRepForBulkVerify => submit_porep_for_bulk_verify,
+        CurrentTotalPower => current_total_power,
+        NetworkRawPowerExported => network_raw_power,
+        MinerRawPowerExported => miner_raw_power,
+        MinerCountExported => miner_count,
+        MinerConsensusCountExported => miner_consensus_count,
     }
 }

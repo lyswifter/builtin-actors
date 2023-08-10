@@ -16,17 +16,19 @@ use fvm_ipld_amt::Error as AmtError;
 use fvm_ipld_bitfield::BitField;
 use fvm_ipld_blockstore::Blockstore;
 use fvm_ipld_encoding::tuple::*;
-use fvm_ipld_encoding::{serde_bytes, BytesDe, Cbor, CborStore};
+use fvm_ipld_encoding::{strict_bytes, BytesDe, CborStore};
 use fvm_ipld_hamt::Error as HamtError;
 use fvm_shared::address::Address;
-use fvm_shared::bigint::bigint_ser;
+
 use fvm_shared::clock::{ChainEpoch, QuantSpec, EPOCH_UNDEFINED};
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::ExitCode;
 use fvm_shared::sector::{RegisteredPoStProof, SectorNumber, SectorSize, MAX_SECTOR_NUMBER};
-use fvm_shared::HAMT_BIT_WIDTH;
-use num_traits::{Signed, Zero};
+use fvm_shared::{ActorID, HAMT_BIT_WIDTH};
+use itertools::Itertools;
+use num_traits::Zero;
 
+use super::beneficiary::*;
 use super::deadlines::new_deadline_info;
 use super::policy::*;
 use super::types::*;
@@ -46,28 +48,24 @@ pub const SECTORS_AMT_BITWIDTH: u32 = 5;
 /// that limits a miner actor's behavior (i.e. no balance withdrawals)
 /// Excess balance as computed by st.GetAvailableBalance will be
 /// withdrawable or usable for pre-commit deposit or pledge lock-up.
-#[derive(Serialize_tuple, Deserialize_tuple, Clone)]
+#[derive(Serialize_tuple, Deserialize_tuple, Clone, Debug)]
 pub struct State {
     /// Contains static info about this miner
     pub info: Cid,
 
     /// Total funds locked as pre_commit_deposit
-    #[serde(with = "bigint_ser")]
     pub pre_commit_deposits: TokenAmount,
 
     /// Total rewards and added funds locked in vesting table
-    #[serde(with = "bigint_ser")]
     pub locked_funds: TokenAmount,
 
     /// VestingFunds (Vesting Funds schedule for the miner).
     pub vesting_funds: Cid,
 
     /// Absolute value of debt this miner owes from unpaid fees.
-    #[serde(with = "bigint_ser")]
     pub fee_debt: TokenAmount,
 
     /// Sum of initial pledge requirements of all active sectors.
-    #[serde(with = "bigint_ser")]
     pub initial_pledge: TokenAmount,
 
     /// Sectors that have been pre-committed but not yet proven.
@@ -112,13 +110,11 @@ pub struct State {
     pub deadline_cron_active: bool,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq)]
 pub enum CollisionPolicy {
     AllowCollisions,
     DenyCollisions,
 }
-
-impl Cbor for State {}
 
 impl State {
     #[allow(clippy::too_many_arguments)]
@@ -986,7 +982,7 @@ impl State {
         &self,
         actor_balance: &TokenAmount,
     ) -> anyhow::Result<TokenAmount> {
-        // (actor_balance - &self.locked_funds) - &self.pre_commit_deposit
+        // (actor_balance - &self.locked_funds) - &self.pre_commit_deposit - &self.initial_pledge
         Ok(self.get_unlocked_balance(actor_balance)? - &self.fee_debt)
     }
 
@@ -1211,7 +1207,7 @@ pub struct AdvanceDeadlineResult {
 }
 
 /// Static information about miner
-#[derive(Debug, PartialEq, Serialize_tuple, Deserialize_tuple)]
+#[derive(Debug, PartialEq, Eq, Serialize_tuple, Deserialize_tuple)]
 pub struct MinerInfo {
     /// Account that owns this miner
     /// - Income and returned collateral are paid to this address
@@ -1231,7 +1227,7 @@ pub struct MinerInfo {
     pub pending_worker_key: Option<WorkerKeyChange>,
 
     /// Libp2p identity that should be used when connecting to this miner
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "strict_bytes")]
     pub peer_id: Vec<u8>,
 
     /// Vector of byte arrays representing Libp2p multi-addresses used for establishing a connection with this miner.
@@ -1254,13 +1250,24 @@ pub struct MinerInfo {
     /// A proposed new owner account for this miner.
     /// Must be confirmed by a message from the pending address itself.
     pub pending_owner_address: Option<Address>,
+
+    /// Account for receive miner benefits, withdraw on miner must send to this address,
+    /// set owner address by default when create miner
+    pub beneficiary: Address,
+
+    /// beneficiary's total quota, how much quota has been withdraw,
+    /// and when this beneficiary expired
+    pub beneficiary_term: BeneficiaryTerm,
+
+    /// A proposal new beneficiary message for this miner
+    pub pending_beneficiary_term: Option<PendingBeneficiaryChange>,
 }
 
 impl MinerInfo {
     pub fn new(
-        owner: Address,
-        worker: Address,
-        control_addresses: Vec<Address>,
+        owner: ActorID,
+        worker: ActorID,
+        control_addresses: Vec<ActorID>,
         peer_id: Vec<u8>,
         multi_address: Vec<BytesDe>,
         window_post_proof_type: RegisteredPoStProof,
@@ -1274,10 +1281,14 @@ impl MinerInfo {
             .map_err(|e| actor_error!(illegal_argument, "invalid partition sectors: {}", e))?;
 
         Ok(Self {
-            owner,
-            worker,
-            control_addresses,
+            owner: Address::new_id(owner),
+            worker: Address::new_id(worker),
+            control_addresses: control_addresses.into_iter().map(Address::new_id).collect_vec(),
+
             pending_worker_key: None,
+            beneficiary: Address::new_id(owner),
+            beneficiary_term: BeneficiaryTerm::default(),
+            pending_beneficiary_term: None,
             peer_id,
             multi_address,
             window_post_proof_type,

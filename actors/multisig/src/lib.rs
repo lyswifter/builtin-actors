@@ -1,24 +1,24 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
+use fvm_actor_utils::receiver::UniversalReceiverParams;
 use std::collections::BTreeSet;
+
+use fvm_ipld_blockstore::Blockstore;
+use fvm_ipld_encoding::RawBytes;
+use fvm_shared::address::Address;
+use fvm_shared::econ::TokenAmount;
+use fvm_shared::error::ExitCode;
+use fvm_shared::{HAMT_BIT_WIDTH, METHOD_CONSTRUCTOR};
+use num_derive::FromPrimitive;
+use num_traits::Zero;
 
 use fil_actors_runtime::cbor::serialize_vec;
 use fil_actors_runtime::runtime::{ActorCode, Primitives, Runtime};
 use fil_actors_runtime::{
-    actor_error, cbor, make_empty_map, make_map_with_root, resolve_to_id_addr, ActorDowncast,
-    ActorError, Map, INIT_ACTOR_ADDR,
+    actor_dispatch, actor_error, extract_send_result, make_empty_map, make_map_with_root,
+    resolve_to_actor_id, ActorContext, ActorError, AsActorError, Map, INIT_ACTOR_ADDR,
 };
-use fvm_ipld_blockstore::Blockstore;
-use fvm_ipld_encoding::RawBytes;
-use fvm_shared::actor::builtin::CALLER_TYPES_SIGNABLE;
-use fvm_shared::address::Address;
-use fvm_shared::bigint::Sign;
-use fvm_shared::econ::TokenAmount;
-use fvm_shared::error::ExitCode;
-use fvm_shared::{MethodNum, HAMT_BIT_WIDTH, METHOD_CONSTRUCTOR};
-use num_derive::FromPrimitive;
-use num_traits::{FromPrimitive, Signed};
 
 pub use self::state::*;
 pub use self::types::*;
@@ -29,8 +29,6 @@ fil_actors_runtime::wasm_trampoline!(Actor);
 mod state;
 pub mod testing;
 mod types;
-
-// * Updated to specs-actors commit: 845089a6d2580e46055c24415a6c32ee688e5186 (v3.0.0)
 
 /// Multisig actor methods available
 #[derive(FromPrimitive)]
@@ -45,18 +43,17 @@ pub enum Method {
     SwapSigner = 7,
     ChangeNumApprovalsThreshold = 8,
     LockBalance = 9,
+    // Method numbers derived from FRC-0042 standards
+    UniversalReceiverHook = frc42_dispatch::method_hash!("Receive"),
 }
 
 /// Multisig Actor
 pub struct Actor;
+
 impl Actor {
     /// Constructor for Multisig actor
-    pub fn constructor<BS, RT>(rt: &mut RT, params: ConstructorParams) -> Result<(), ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
-        rt.validate_immediate_caller_is(std::iter::once(&*INIT_ACTOR_ADDR))?;
+    pub fn constructor(rt: &impl Runtime, params: ConstructorParams) -> Result<(), ActorError> {
+        rt.validate_immediate_caller_is(std::iter::once(&INIT_ACTOR_ADDR))?;
 
         if params.signers.is_empty() {
             return Err(actor_error!(illegal_argument; "Must have at least one signer"));
@@ -74,18 +71,13 @@ impl Actor {
         let mut resolved_signers = Vec::with_capacity(params.signers.len());
         let mut dedup_signers = BTreeSet::new();
         for signer in &params.signers {
-            let resolved = resolve_to_id_addr(rt, signer).map_err(|e| {
-                e.downcast_default(
-                    ExitCode::USR_ILLEGAL_STATE,
-                    format!("failed to resolve addr {} to ID addr", signer),
-                )
-            })?;
-            if !dedup_signers.insert(resolved.id().expect("address should be resolved")) {
+            let resolved = resolve_to_actor_id(rt, signer, true)?;
+            if !dedup_signers.insert(resolved) {
                 return Err(
                     actor_error!(illegal_argument; "duplicate signer not allowed: {}", signer),
                 );
             }
-            resolved_signers.push(resolved);
+            resolved_signers.push(Address::new_id(resolved));
         }
 
         if params.num_approvals_threshold > params.signers.len() as u64 {
@@ -102,16 +94,15 @@ impl Actor {
             return Err(actor_error!(illegal_argument; "negative unlock duration disallowed"));
         }
 
-        let empty_root =
-            make_empty_map::<_, ()>(rt.store(), HAMT_BIT_WIDTH).flush().map_err(|e| {
-                e.downcast_default(ExitCode::USR_ILLEGAL_STATE, "Failed to create empty map")
-            })?;
+        let empty_root = make_empty_map::<_, ()>(rt.store(), HAMT_BIT_WIDTH)
+            .flush()
+            .context_code(ExitCode::USR_ILLEGAL_STATE, "failed to create empty map")?;
 
         let mut st: State = State {
             signers: resolved_signers,
             num_approvals_threshold: params.num_approvals_threshold,
             pending_txs: empty_root,
-            initial_balance: TokenAmount::from(0),
+            initial_balance: TokenAmount::zero(),
             next_tx_id: Default::default(),
             start_epoch: Default::default(),
             unlock_duration: Default::default(),
@@ -130,15 +121,11 @@ impl Actor {
     }
 
     /// Multisig actor propose function
-    pub fn propose<BS, RT>(rt: &mut RT, params: ProposeParams) -> Result<ProposeReturn, ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
-        rt.validate_immediate_caller_type(CALLER_TYPES_SIGNABLE.iter())?;
+    pub fn propose(rt: &impl Runtime, params: ProposeParams) -> Result<ProposeReturn, ActorError> {
+        rt.validate_immediate_caller_accept_any()?;
         let proposer: Address = rt.message().caller();
 
-        if params.value.sign() == Sign::Minus {
+        if params.value.is_negative() {
             return Err(actor_error!(
                 illegal_argument,
                 "proposed value must be non-negative, was {}",
@@ -151,12 +138,8 @@ impl Actor {
                 return Err(actor_error!(forbidden, "{} is not a signer", proposer));
             }
 
-            let mut ptx = make_map_with_root(&st.pending_txs, rt.store()).map_err(|e| {
-                e.downcast_default(
-                    ExitCode::USR_ILLEGAL_STATE,
-                    "failed to load pending transactions",
-                )
-            })?;
+            let mut ptx = make_map_with_root(&st.pending_txs, rt.store())
+                .context_code(ExitCode::USR_ILLEGAL_STATE, "failed to load pending transactions")?;
 
             let t_id = st.next_tx_id;
             st.next_tx_id.0 += 1;
@@ -169,19 +152,15 @@ impl Actor {
                 approved: Vec::new(),
             };
 
-            ptx.set(t_id.key(), txn.clone()).map_err(|e| {
-                e.downcast_default(
-                    ExitCode::USR_ILLEGAL_STATE,
-                    "failed to put transaction for propose",
-                )
-            })?;
+            ptx.set(t_id.key(), txn.clone()).context_code(
+                ExitCode::USR_ILLEGAL_STATE,
+                "failed to put transaction for propose",
+            )?;
 
-            st.pending_txs = ptx.flush().map_err(|e| {
-                e.downcast_default(
-                    ExitCode::USR_ILLEGAL_STATE,
-                    "failed to flush pending transactions",
-                )
-            })?;
+            st.pending_txs = ptx.flush().context_code(
+                ExitCode::USR_ILLEGAL_STATE,
+                "failed to flush pending transactions",
+            )?;
 
             Ok((t_id, txn))
         })?;
@@ -192,12 +171,8 @@ impl Actor {
     }
 
     /// Multisig actor approve function
-    pub fn approve<BS, RT>(rt: &mut RT, params: TxnIDParams) -> Result<ApproveReturn, ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
-        rt.validate_immediate_caller_type(CALLER_TYPES_SIGNABLE.iter())?;
+    pub fn approve(rt: &impl Runtime, params: TxnIDParams) -> Result<ApproveReturn, ActorError> {
+        rt.validate_immediate_caller_accept_any()?;
         let approver: Address = rt.message().caller();
 
         let id = params.id;
@@ -206,12 +181,8 @@ impl Actor {
                 return Err(actor_error!(forbidden; "{} is not a signer", approver));
             }
 
-            let ptx = make_map_with_root(&st.pending_txs, rt.store()).map_err(|e| {
-                e.downcast_default(
-                    ExitCode::USR_ILLEGAL_STATE,
-                    "failed to load pending transactions",
-                )
-            })?;
+            let ptx = make_map_with_root(&st.pending_txs, rt.store())
+                .context_code(ExitCode::USR_ILLEGAL_STATE, "failed to load pending transactions")?;
 
             let txn = get_transaction(rt, &ptx, params.id, params.proposal_hash)?;
 
@@ -232,12 +203,8 @@ impl Actor {
     }
 
     /// Multisig actor cancel function
-    pub fn cancel<BS, RT>(rt: &mut RT, params: TxnIDParams) -> Result<(), ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
-        rt.validate_immediate_caller_type(CALLER_TYPES_SIGNABLE.iter())?;
+    pub fn cancel(rt: &impl Runtime, params: TxnIDParams) -> Result<(), ActorError> {
+        rt.validate_immediate_caller_accept_any()?;
         let caller_addr: Address = rt.message().caller();
 
         rt.transaction(|st: &mut State, rt| {
@@ -246,20 +213,12 @@ impl Actor {
             }
 
             let mut ptx = make_map_with_root::<_, Transaction>(&st.pending_txs, rt.store())
-                .map_err(|e| {
-                    e.downcast_default(
-                        ExitCode::USR_ILLEGAL_STATE,
-                        "failed to load pending transactions",
-                    )
-                })?;
+                .context_code(ExitCode::USR_ILLEGAL_STATE, "failed to load pending transactions")?;
 
             let (_, tx) = ptx
                 .delete(&params.id.key())
-                .map_err(|e| {
-                    e.downcast_default(
-                        ExitCode::USR_ILLEGAL_STATE,
-                        format!("failed to pop transaction {:?} for cancel", params.id),
-                    )
+                .with_context_code(ExitCode::USR_ILLEGAL_STATE, || {
+                    format!("failed to pop transaction {:?} for cancel", params.id)
                 })?
                 .ok_or_else(|| {
                     actor_error!(not_found, "no such transaction {:?} to cancel", params.id)
@@ -270,42 +229,29 @@ impl Actor {
                 return Err(actor_error!(forbidden; "Cannot cancel another signers transaction"));
             }
 
-            let calculated_hash = compute_proposal_hash(&tx, rt).map_err(|e| {
-                e.downcast_default(
-                    ExitCode::USR_ILLEGAL_STATE,
-                    format!("failed to compute proposal hash for (tx: {:?})", params.id),
-                )
-            })?;
+            let calculated_hash = compute_proposal_hash(&tx, rt)
+                .with_context_code(ExitCode::USR_ILLEGAL_STATE, || {
+                    format!("failed to compute proposal hash for (tx: {:?})", params.id)
+                })?;
 
             if !params.proposal_hash.is_empty() && params.proposal_hash != calculated_hash {
                 return Err(actor_error!(illegal_state, "hash does not match proposal params"));
             }
 
-            st.pending_txs = ptx.flush().map_err(|e| {
-                e.downcast_default(
-                    ExitCode::USR_ILLEGAL_STATE,
-                    "failed to flush pending transactions",
-                )
-            })?;
+            st.pending_txs = ptx.flush().context_code(
+                ExitCode::USR_ILLEGAL_STATE,
+                "failed to flush pending transactions",
+            )?;
 
             Ok(())
         })
     }
 
     /// Multisig actor function to add signers to multisig
-    pub fn add_signer<BS, RT>(rt: &mut RT, params: AddSignerParams) -> Result<(), ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
+    pub fn add_signer(rt: &impl Runtime, params: AddSignerParams) -> Result<(), ActorError> {
         let receiver = rt.message().receiver();
         rt.validate_immediate_caller_is(std::iter::once(&receiver))?;
-        let resolved_new_signer = resolve_to_id_addr(rt, &params.signer).map_err(|e| {
-            e.downcast_default(
-                ExitCode::USR_ILLEGAL_STATE,
-                format!("failed to resolve address {}", params.signer),
-            )
-        })?;
+        let resolved_new_signer = resolve_to_actor_id(rt, &params.signer, true)?;
 
         rt.transaction(|st: &mut State, _| {
             if st.signers.len() >= SIGNERS_MAX {
@@ -315,12 +261,12 @@ impl Actor {
                     SIGNERS_MAX
                 ));
             }
-            if st.is_signer(&resolved_new_signer) {
+            if st.is_signer(&Address::new_id(resolved_new_signer)) {
                 return Err(actor_error!(forbidden, "{} is already a signer", resolved_new_signer));
             }
 
             // Add signer and increase threshold if set
-            st.signers.push(resolved_new_signer);
+            st.signers.push(Address::new_id(resolved_new_signer));
             if params.increase {
                 st.num_approvals_threshold += 1;
             }
@@ -330,22 +276,13 @@ impl Actor {
     }
 
     /// Multisig actor function to remove signers to multisig
-    pub fn remove_signer<BS, RT>(rt: &mut RT, params: RemoveSignerParams) -> Result<(), ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
+    pub fn remove_signer(rt: &impl Runtime, params: RemoveSignerParams) -> Result<(), ActorError> {
         let receiver = rt.message().receiver();
         rt.validate_immediate_caller_is(std::iter::once(&receiver))?;
-        let resolved_old_signer = resolve_to_id_addr(rt, &params.signer).map_err(|e| {
-            e.downcast_default(
-                ExitCode::USR_ILLEGAL_STATE,
-                format!("failed to resolve address {}", params.signer),
-            )
-        })?;
+        let resolved_old_signer = resolve_to_actor_id(rt, &params.signer, false)?;
 
         rt.transaction(|st: &mut State, rt| {
-            if !st.is_signer(&resolved_old_signer) {
+            if !st.is_signer(&Address::new_id(resolved_old_signer)) {
                 return Err(actor_error!(forbidden, "{} is not a signer", resolved_old_signer));
             }
 
@@ -375,13 +312,9 @@ impl Actor {
             }
 
             // Remove approvals from removed signer
-            st.purge_approvals(rt.store(), &resolved_old_signer).map_err(|e| {
-                e.downcast_default(
-                    ExitCode::USR_ILLEGAL_STATE,
-                    "failed to purge approvals of removed signer",
-                )
-            })?;
-            st.signers.retain(|s| s != &resolved_old_signer);
+            st.purge_approvals(rt.store(), &Address::new_id(resolved_old_signer))
+                .context("failed to purge approvals of removed signer")?;
+            st.signers.retain(|s| s != &Address::new_id(resolved_old_signer));
 
             Ok(())
         })?;
@@ -390,47 +323,28 @@ impl Actor {
     }
 
     /// Multisig actor function to swap signers to multisig
-    pub fn swap_signer<BS, RT>(rt: &mut RT, params: SwapSignerParams) -> Result<(), ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
+    pub fn swap_signer(rt: &impl Runtime, params: SwapSignerParams) -> Result<(), ActorError> {
         let receiver = rt.message().receiver();
         rt.validate_immediate_caller_is(std::iter::once(&receiver))?;
-        let from_resolved = resolve_to_id_addr(rt, &params.from).map_err(|e| {
-            e.downcast_default(
-                ExitCode::USR_ILLEGAL_STATE,
-                format!("failed to resolve address {}", params.from),
-            )
-        })?;
-        let to_resolved = resolve_to_id_addr(rt, &params.to).map_err(|e| {
-            e.downcast_default(
-                ExitCode::USR_ILLEGAL_STATE,
-                format!("failed to resolve address {}", params.to),
-            )
-        })?;
+        let from_resolved = resolve_to_actor_id(rt, &params.from, false)?;
+        let to_resolved = resolve_to_actor_id(rt, &params.to, true)?;
 
         rt.transaction(|st: &mut State, rt| {
-            if !st.is_signer(&from_resolved) {
+            if !st.is_signer(&Address::new_id(from_resolved)) {
                 return Err(actor_error!(forbidden; "{} is not a signer", from_resolved));
             }
 
-            if st.is_signer(&to_resolved) {
+            if st.is_signer(&Address::new_id(to_resolved)) {
                 return Err(actor_error!(illegal_argument; "{} is already a signer", to_resolved));
             }
 
             // Remove signer from state (retain preserves order of elements)
-            st.signers.retain(|s| s != &from_resolved);
+            st.signers.retain(|s| s != &Address::new_id(from_resolved));
 
             // Add new signer
-            st.signers.push(to_resolved);
+            st.signers.push(Address::new_id(to_resolved));
 
-            st.purge_approvals(rt.store(), &from_resolved).map_err(|e| {
-                e.downcast_default(
-                    ExitCode::USR_ILLEGAL_STATE,
-                    "failed to purge approvals of removed signer",
-                )
-            })?;
+            st.purge_approvals(rt.store(), &Address::new_id(from_resolved))?;
             Ok(())
         })?;
 
@@ -438,14 +352,10 @@ impl Actor {
     }
 
     /// Multisig actor function to change number of approvals needed
-    pub fn change_num_approvals_threshold<BS, RT>(
-        rt: &mut RT,
+    pub fn change_num_approvals_threshold(
+        rt: &impl Runtime,
         params: ChangeNumApprovalsThresholdParams,
-    ) -> Result<(), ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
+    ) -> Result<(), ActorError> {
         let receiver = rt.message().receiver();
         rt.validate_immediate_caller_is(std::iter::once(&receiver))?;
 
@@ -464,11 +374,7 @@ impl Actor {
     }
 
     /// Multisig actor function to change number of approvals needed
-    pub fn lock_balance<BS, RT>(rt: &mut RT, params: LockBalanceParams) -> Result<(), ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
+    pub fn lock_balance(rt: &impl Runtime, params: LockBalanceParams) -> Result<(), ActorError> {
         let receiver = rt.message().receiver();
         rt.validate_immediate_caller_is(std::iter::once(&receiver))?;
 
@@ -491,15 +397,11 @@ impl Actor {
         Ok(())
     }
 
-    fn approve_transaction<BS, RT>(
-        rt: &mut RT,
+    fn approve_transaction(
+        rt: &impl Runtime,
         tx_id: TxnID,
         mut txn: Transaction,
-    ) -> Result<(bool, RawBytes, ExitCode), ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
+    ) -> Result<(bool, RawBytes, ExitCode), ActorError> {
         for previous_approver in &txn.approved {
             if *previous_approver == rt.message().caller() {
                 return Err(actor_error!(
@@ -511,29 +413,21 @@ impl Actor {
         }
 
         let st = rt.transaction(|st: &mut State, rt| {
-            let mut ptx = make_map_with_root(&st.pending_txs, rt.store()).map_err(|e| {
-                e.downcast_default(
-                    ExitCode::USR_ILLEGAL_STATE,
-                    "failed to load pending transactions",
-                )
-            })?;
+            let mut ptx = make_map_with_root(&st.pending_txs, rt.store())
+                .context_code(ExitCode::USR_ILLEGAL_STATE, "failed to load pending transactions")?;
 
             // update approved on the transaction
             txn.approved.push(rt.message().caller());
 
-            ptx.set(tx_id.key(), txn.clone()).map_err(|e| {
-                e.downcast_default(
-                    ExitCode::USR_ILLEGAL_STATE,
-                    format!("failed to put transaction {} for approval", tx_id.0),
-                )
-            })?;
+            ptx.set(tx_id.key(), txn.clone())
+                .with_context_code(ExitCode::USR_ILLEGAL_STATE, || {
+                    format!("failed to put transaction {} for approval", tx_id.0)
+                })?;
 
-            st.pending_txs = ptx.flush().map_err(|e| {
-                e.downcast_default(
-                    ExitCode::USR_ILLEGAL_STATE,
-                    "failed to flush pending transactions",
-                )
-            })?;
+            st.pending_txs = ptx.flush().context_code(
+                ExitCode::USR_ILLEGAL_STATE,
+                "failed to flush pending transactions",
+            )?;
 
             // Go implementation holds reference to state after transaction so this must be cloned
             // to match to handle possible exit code inconsistency
@@ -542,58 +436,59 @@ impl Actor {
 
         execute_transaction_if_approved(rt, &st, tx_id, &txn)
     }
+
+    // Always succeeds, accepting any transfers, so long as the params are valid `UniversalReceiverParams`.
+    pub fn universal_receiver_hook(
+        rt: &impl Runtime,
+        _params: UniversalReceiverParams,
+    ) -> Result<(), ActorError> {
+        rt.validate_immediate_caller_accept_any()?;
+        Ok(())
+    }
 }
 
-fn execute_transaction_if_approved<BS, RT>(
-    rt: &mut RT,
+fn execute_transaction_if_approved(
+    rt: &impl Runtime,
     st: &State,
     txn_id: TxnID,
     txn: &Transaction,
-) -> Result<(bool, RawBytes, ExitCode), ActorError>
-where
-    BS: Blockstore,
-    RT: Runtime<BS>,
-{
+) -> Result<(bool, RawBytes, ExitCode), ActorError> {
     let mut out = RawBytes::default();
     let mut code = ExitCode::OK;
     let mut applied = false;
     let threshold_met = txn.approved.len() as u64 >= st.num_approvals_threshold;
     if threshold_met {
-        st.check_available(rt.current_balance(), &txn.value, rt.curr_epoch())
-            .map_err(|e| actor_error!(insufficient_funds, "insufficient funds unlocked: {}", e))?;
+        st.check_available(rt.current_balance(), &txn.value, rt.curr_epoch())?;
 
-        match rt.send(txn.to, txn.method, txn.params.clone(), txn.value.clone()) {
-            Ok(ser) => {
-                out = ser;
+        match extract_send_result(rt.send_simple(
+            &txn.to,
+            txn.method,
+            txn.params.clone().into(),
+            txn.value.clone(),
+        )) {
+            Ok(Some(r)) => {
+                out = RawBytes::new(r.data);
             }
             Err(e) => {
                 code = e.exit_code();
             }
+            _ => {}
         }
         applied = true;
 
         rt.transaction(|st: &mut State, rt| {
             let mut ptx = make_map_with_root::<_, Transaction>(&st.pending_txs, rt.store())
-                .map_err(|e| {
-                    e.downcast_default(
-                        ExitCode::USR_ILLEGAL_STATE,
-                        "failed to load pending transactions",
-                    )
-                })?;
+                .context_code(ExitCode::USR_ILLEGAL_STATE, "failed to load pending transactions")?;
 
-            ptx.delete(&txn_id.key()).map_err(|e| {
-                e.downcast_default(
-                    ExitCode::USR_ILLEGAL_STATE,
-                    "failed to delete transaction for cleanup",
-                )
-            })?;
+            ptx.delete(&txn_id.key()).context_code(
+                ExitCode::USR_ILLEGAL_STATE,
+                "failed to delete transaction for cleanup",
+            )?;
 
-            st.pending_txs = ptx.flush().map_err(|e| {
-                e.downcast_default(
-                    ExitCode::USR_ILLEGAL_STATE,
-                    "failed to flush pending transactions",
-                )
-            })?;
+            st.pending_txs = ptx.flush().context_code(
+                ExitCode::USR_ILLEGAL_STATE,
+                "failed to flush pending transactions",
+            )?;
             Ok(())
         })?;
     }
@@ -609,25 +504,20 @@ fn get_transaction<'bs, 'm, BS, RT>(
 ) -> Result<&'m Transaction, ActorError>
 where
     BS: Blockstore,
-    RT: Runtime<BS>,
+    RT: Runtime,
 {
     let txn = ptx
         .get(&txn_id.key())
-        .map_err(|e| {
-            e.downcast_default(
-                ExitCode::USR_ILLEGAL_STATE,
-                format!("failed to load transaction {:?} for approval", txn_id),
-            )
+        .with_context_code(ExitCode::USR_ILLEGAL_STATE, || {
+            format!("failed to load transaction {:?} for approval", txn_id)
         })?
         .ok_or_else(|| actor_error!(not_found, "no such transaction {:?} for approval", txn_id))?;
 
     if !proposal_hash.is_empty() {
-        let calculated_hash = compute_proposal_hash(txn, rt).map_err(|e| {
-            e.downcast_default(
-                ExitCode::USR_ILLEGAL_STATE,
-                format!("failed to compute proposal hash for (tx: {:?})", txn_id),
-            )
-        })?;
+        let calculated_hash = compute_proposal_hash(txn, rt)
+            .with_context_code(ExitCode::USR_ILLEGAL_STATE, || {
+                format!("failed to compute proposal hash for (tx: {:?})", txn_id)
+            })?;
 
         if proposal_hash != calculated_hash {
             return Err(actor_error!(
@@ -655,53 +545,17 @@ pub fn compute_proposal_hash(txn: &Transaction, sys: &dyn Primitives) -> anyhow:
 }
 
 impl ActorCode for Actor {
-    fn invoke_method<BS, RT>(
-        rt: &mut RT,
-        method: MethodNum,
-        params: &RawBytes,
-    ) -> Result<RawBytes, ActorError>
-    where
-        BS: Blockstore,
-        RT: Runtime<BS>,
-    {
-        match FromPrimitive::from_u64(method) {
-            Some(Method::Constructor) => {
-                Self::constructor(rt, cbor::deserialize_params(params)?)?;
-                Ok(RawBytes::default())
-            }
-            Some(Method::Propose) => {
-                let res = Self::propose(rt, cbor::deserialize_params(params)?)?;
-                Ok(RawBytes::serialize(res)?)
-            }
-            Some(Method::Approve) => {
-                let res = Self::approve(rt, cbor::deserialize_params(params)?)?;
-                Ok(RawBytes::serialize(res)?)
-            }
-            Some(Method::Cancel) => {
-                Self::cancel(rt, cbor::deserialize_params(params)?)?;
-                Ok(RawBytes::default())
-            }
-            Some(Method::AddSigner) => {
-                Self::add_signer(rt, cbor::deserialize_params(params)?)?;
-                Ok(RawBytes::default())
-            }
-            Some(Method::RemoveSigner) => {
-                Self::remove_signer(rt, cbor::deserialize_params(params)?)?;
-                Ok(RawBytes::default())
-            }
-            Some(Method::SwapSigner) => {
-                Self::swap_signer(rt, cbor::deserialize_params(params)?)?;
-                Ok(RawBytes::default())
-            }
-            Some(Method::ChangeNumApprovalsThreshold) => {
-                Self::change_num_approvals_threshold(rt, cbor::deserialize_params(params)?)?;
-                Ok(RawBytes::default())
-            }
-            Some(Method::LockBalance) => {
-                Self::lock_balance(rt, cbor::deserialize_params(params)?)?;
-                Ok(RawBytes::default())
-            }
-            None => Err(actor_error!(unhandled_message, "Invalid method")),
-        }
+    type Methods = Method;
+    actor_dispatch! {
+      Constructor => constructor,
+      Propose => propose,
+      Approve => approve,
+      Cancel => cancel,
+      AddSigner => add_signer,
+      RemoveSigner => remove_signer,
+      SwapSigner => swap_signer,
+      ChangeNumApprovalsThreshold => change_num_approvals_threshold,
+      LockBalance => lock_balance,
+      UniversalReceiverHook => universal_receiver_hook,
     }
 }

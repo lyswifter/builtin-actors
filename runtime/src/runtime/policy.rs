@@ -1,6 +1,3 @@
-use std::collections::HashSet;
-
-use fvm_shared::bigint::bigint_ser;
 use fvm_shared::clock::ChainEpoch;
 use fvm_shared::sector::{RegisteredPoStProof, RegisteredSealProof, StoragePower};
 use num_traits::FromPrimitive;
@@ -130,15 +127,23 @@ pub struct Policy {
     pub chain_finality: ChainEpoch,
 
     /// Allowed post proof types for new miners
-    pub valid_post_proof_type: HashSet<RegisteredPoStProof>,
+    pub valid_post_proof_type: ProofSet,
 
     /// Allowed pre commit proof types for new miners
-    pub valid_pre_commit_proof_type: HashSet<RegisteredSealProof>,
+    pub valid_pre_commit_proof_type: ProofSet,
 
     // --- verifreg policy
     /// Minimum verified deal size
-    #[serde(with = "bigint_ser")]
-    pub minimum_verified_deal_size: StoragePower,
+    pub minimum_verified_allocation_size: StoragePower,
+    /// Minimum term for a verified data allocation (epochs)
+    pub minimum_verified_allocation_term: i64,
+    /// Maximum term for a verified data allocaion (epochs)
+    pub maximum_verified_allocation_term: i64,
+    /// Maximum time a verified allocation can be active without being claimed (epochs).
+    /// Supports recovery of erroneous allocations and prevents indefinite squatting on datacap.
+    pub maximum_verified_allocation_expiration: i64,
+    // Period of time at the end of a sector's life during which claims can be dropped
+    pub end_of_life_claim_drop_period: ChainEpoch,
 
     //  --- market policy ---
     /// The number of blocks between payouts for deals
@@ -152,9 +157,12 @@ pub struct Policy {
     /// supply that must be covered by provider collateral
     pub prov_collateral_percent_supply_denom: i64,
 
+    /// The default duration after a verified deal's nominal term to set for the corresponding
+    /// allocation's maximum term.
+    pub market_default_allocation_term_buffer: i64,
+
     // --- power ---
     /// Minimum miner consensus power
-    #[serde(with = "bigint_ser")]
     pub minimum_consensus_power: StoragePower,
 }
 
@@ -196,41 +204,24 @@ impl Default for Policy {
             new_sectors_per_period_max: policy_constants::NEW_SECTORS_PER_PERIOD_MAX,
             chain_finality: policy_constants::CHAIN_FINALITY,
 
-            valid_post_proof_type: HashSet::<RegisteredPoStProof>::from([
-                #[cfg(feature = "sector-2k")]
-                RegisteredPoStProof::StackedDRGWindow2KiBV1,
-                #[cfg(feature = "sector-8m")]
-                RegisteredPoStProof::StackedDRGWindow8MiBV1,
-                #[cfg(feature = "sector-512m")]
-                RegisteredPoStProof::StackedDRGWindow512MiBV1,
-                #[cfg(feature = "sector-32g")]
-                RegisteredPoStProof::StackedDRGWindow32GiBV1,
-                #[cfg(feature = "sector-64g")]
-                RegisteredPoStProof::StackedDRGWindow64GiBV1,
-            ]),
-            valid_pre_commit_proof_type: HashSet::<RegisteredSealProof>::from([
-                #[cfg(feature = "sector-2k")]
-                RegisteredSealProof::StackedDRG2KiBV1P1,
-                #[cfg(feature = "sector-8m")]
-                RegisteredSealProof::StackedDRG8MiBV1P1,
-                #[cfg(feature = "sector-512m")]
-                RegisteredSealProof::StackedDRG512MiBV1P1,
-                #[cfg(feature = "sector-32g")]
-                RegisteredSealProof::StackedDRG32GiBV1P1,
-                #[cfg(feature = "sector-64g")]
-                RegisteredSealProof::StackedDRG64GiBV1P1,
-            ]),
-
-            minimum_verified_deal_size: StoragePower::from_i32(
-                policy_constants::MINIMUM_VERIFIED_DEAL_SIZE,
+            valid_post_proof_type: ProofSet::default_post_proofs(),
+            valid_pre_commit_proof_type: ProofSet::default_seal_proofs(),
+            minimum_verified_allocation_size: StoragePower::from_i32(
+                policy_constants::MINIMUM_VERIFIED_ALLOCATION_SIZE,
             )
             .unwrap(),
-
+            minimum_verified_allocation_term: policy_constants::MINIMUM_VERIFIED_ALLOCATION_TERM,
+            maximum_verified_allocation_term: policy_constants::MAXIMUM_VERIFIED_ALLOCATION_TERM,
+            maximum_verified_allocation_expiration:
+                policy_constants::MAXIMUM_VERIFIED_ALLOCATION_EXPIRATION,
+            end_of_life_claim_drop_period: policy_constants::END_OF_LIFE_CLAIM_DROP_PERIOD,
             deal_updates_interval: policy_constants::DEAL_UPDATES_INTERVAL,
             prov_collateral_percent_supply_num:
                 policy_constants::PROV_COLLATERAL_PERCENT_SUPPLY_NUM,
             prov_collateral_percent_supply_denom:
                 policy_constants::PROV_COLLATERAL_PERCENT_SUPPLY_DENOM,
+            market_default_allocation_term_buffer:
+                policy_constants::MARKET_DEFAULT_ALLOCATION_TERM_BUFFER,
 
             minimum_consensus_power: StoragePower::from(policy_constants::MINIMUM_CONSENSUS_POWER),
         }
@@ -238,9 +229,10 @@ impl Default for Policy {
 }
 
 pub mod policy_constants {
-    use crate::builtin::*;
     use fvm_shared::clock::ChainEpoch;
     use fvm_shared::clock::EPOCH_DURATION_SECONDS;
+
+    use crate::builtin::*;
 
     /// Maximum amount of sectors that can be aggregated.
     pub const MAX_AGGREGATED_SECTORS: u64 = 819;
@@ -362,10 +354,20 @@ pub mod policy_constants {
     /// This is a conservative value that is chosen via simulations of all known attacks.
     pub const CHAIN_FINALITY: ChainEpoch = 900;
 
+    /// The number of total possible types (enum variants) of RegisteredPoStProof
+    pub const REGISTERED_POST_PROOF_VARIANTS: usize = 10;
+
+    /// The number of total possible types (enum variants) of RegisteredSealProof
+    pub const REGISTERED_SEAL_PROOF_VARIANTS: usize = 10;
+
     #[cfg(not(feature = "small-deals"))]
-    pub const MINIMUM_VERIFIED_DEAL_SIZE: i32 = 1 << 20;
+    pub const MINIMUM_VERIFIED_ALLOCATION_SIZE: i32 = 1 << 20;
     #[cfg(feature = "small-deals")]
-    pub const MINIMUM_VERIFIED_DEAL_SIZE: i32 = 256;
+    pub const MINIMUM_VERIFIED_ALLOCATION_SIZE: i32 = 256;
+    pub const MINIMUM_VERIFIED_ALLOCATION_TERM: i64 = 180 * EPOCHS_IN_DAY;
+    pub const MAXIMUM_VERIFIED_ALLOCATION_TERM: i64 = 5 * EPOCHS_IN_YEAR;
+    pub const MAXIMUM_VERIFIED_ALLOCATION_EXPIRATION: i64 = 60 * EPOCHS_IN_DAY;
+    pub const END_OF_LIFE_CLAIM_DROP_PERIOD: ChainEpoch = 30 * EPOCHS_IN_DAY;
 
     /// DealUpdatesInterval is the number of blocks between payouts for deals
     pub const DEAL_UPDATES_INTERVAL: i64 = EPOCHS_IN_DAY;
@@ -381,6 +383,8 @@ pub mod policy_constants {
     /// supply that must be covered by provider collateral
     pub const PROV_COLLATERAL_PERCENT_SUPPLY_DENOM: i64 = 100;
 
+    pub const MARKET_DEFAULT_ALLOCATION_TERM_BUFFER: i64 = 90 * EPOCHS_IN_DAY;
+
     #[cfg(feature = "min-power-2k")]
     pub const MINIMUM_CONSENSUS_POWER: i64 = 2 << 10;
     #[cfg(feature = "min-power-2g")]
@@ -393,4 +397,76 @@ pub mod policy_constants {
         feature = "min-power-32g"
     )))]
     pub const MINIMUM_CONSENSUS_POWER: i64 = 10 << 40;
+}
+
+/// A set indicating which proofs are considered valid, optimised for lookup of a small number of
+/// sequential enum variants. Backed by an array of booleans where each index indicates if that
+/// proof type is valid
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub struct ProofSet(Vec<bool>);
+
+impl ProofSet {
+    /// Create a `ProofSet` for enabled `RegisteredPoStProof`s
+    pub fn default_post_proofs() -> Self {
+        let mut proofs = vec![false; policy_constants::REGISTERED_POST_PROOF_VARIANTS];
+        #[cfg(feature = "sector-2k")]
+        {
+            proofs[i64::from(RegisteredPoStProof::StackedDRGWindow2KiBV1) as usize] = true;
+        }
+        #[cfg(feature = "sector-8m")]
+        {
+            proofs[i64::from(RegisteredPoStProof::StackedDRGWindow8MiBV1) as usize] = true;
+        }
+        #[cfg(feature = "sector-512m")]
+        {
+            proofs[i64::from(RegisteredPoStProof::StackedDRGWindow512MiBV1) as usize] = true;
+        }
+        #[cfg(feature = "sector-32g")]
+        {
+            proofs[i64::from(RegisteredPoStProof::StackedDRGWindow32GiBV1) as usize] = true;
+        }
+        #[cfg(feature = "sector-64g")]
+        {
+            proofs[i64::from(RegisteredPoStProof::StackedDRGWindow64GiBV1) as usize] = true;
+        }
+        ProofSet(proofs)
+    }
+
+    /// Create a `ProofSet` for enabled `RegisteredSealProof`s
+    pub fn default_seal_proofs() -> Self {
+        let mut proofs = vec![false; policy_constants::REGISTERED_SEAL_PROOF_VARIANTS];
+        #[cfg(feature = "sector-2k")]
+        {
+            proofs[i64::from(RegisteredSealProof::StackedDRG2KiBV1P1) as usize] = true;
+        }
+        #[cfg(feature = "sector-8m")]
+        {
+            proofs[i64::from(RegisteredSealProof::StackedDRG8MiBV1P1) as usize] = true;
+        }
+        #[cfg(feature = "sector-512m")]
+        {
+            proofs[i64::from(RegisteredSealProof::StackedDRG512MiBV1P1) as usize] = true;
+        }
+        #[cfg(feature = "sector-32g")]
+        {
+            proofs[i64::from(RegisteredSealProof::StackedDRG32GiBV1P1) as usize] = true;
+        }
+        #[cfg(feature = "sector-64g")]
+        {
+            proofs[i64::from(RegisteredSealProof::StackedDRG64GiBV1P1) as usize] = true;
+        }
+        ProofSet(proofs)
+    }
+
+    /// Checks if the requested proof type exists in the set
+    pub fn contains<P: Into<i64>>(&self, proof: P) -> bool {
+        let index: i64 = proof.into();
+        *self.0.get(index as usize).unwrap_or(&false)
+    }
+
+    /// Adds the requested proof type to the set of valid proofs
+    pub fn insert<P: Into<i64>>(&mut self, proof: P) {
+        let index: i64 = proof.into();
+        self.0[index as usize] = true;
+    }
 }
